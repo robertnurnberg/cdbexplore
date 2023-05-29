@@ -177,6 +177,25 @@ class ChessDB:
 
         return True
 
+    async def is_subtree_complete(self, epd):
+        """check if all the moves in the subtree of the position are scored"""
+        board = chess.Board(epd)
+        legalMoves = len(list(board.legal_moves))
+        if legalMoves == 0:
+            return True
+        scored_db_moves = await self.queryall(epd)
+        if len(scored_db_moves) - 1 != legalMoves:
+            return False
+        for m in scored_db_moves:
+            if m == "depth":
+                continue
+            board.push(chess.Move.from_uci(m))
+            # as these recursive calls likely return False anyway, we do not run them in parallel and rather wait for each move in turn
+            if not await self.is_subtree_complete(board.epd()):
+                return False
+            board.pop()
+        return True
+
     async def queryall(self, epd, skipTT=False):
         """query chessdb until scored moves come back"""
 
@@ -494,18 +513,23 @@ async def cdbsearch(epd, depthLimit, concurrency, evalDecay, cursedWins=False):
         await chessdb.add_cdb_pv_positions(board.epd())
         print("  cdb PV len: ", chessdb.cdbPvToLeaf.get(board.epd(), 0), flush=True)
         bestscore, pv = await chessdb.search(board, depth, evalDecay)
+        subtreeComplete = False
         if pv[-1] in ["checkmate", "draw", "invalid"]:
             pvlen = len(pv) - 1
-            if pv[-1] == "checkmate":
-                if await chessdb.pv_has_proven_mate(board.epd(), pv):
-                    pv[-1] = "CHECKMATE" + (
-                        ""
-                        if pvlen == 0
-                        else f" (#{(pvlen+1)//2})"
-                        if bestscore > 0
-                        else f" (#-{pvlen//2})"
-                    )
-
+            if pvlen == 0:
+                subtreeComplete = True
+                pv[-1] = pv[-1].upper()
+            else:
+                if pv[-1] == "checkmate":
+                    if await chessdb.pv_has_proven_mate(board.epd(), pv):
+                        pv[-1] = "CHECKMATE" + (
+                            f" (#{(pvlen+1)//2})"
+                            if bestscore > 0
+                            else f" (#-{pvlen//2})"
+                        )
+                # for proven mates and draws we check if the subtree is fully explored
+                if pv[-1][0] in ["C", "d"]:
+                    subtreeComplete = await chessdb.is_subtree_complete(board.epd())
         else:
             pvlen = len(pv)
         runtime = time.perf_counter() - chessdb.count_starttime
@@ -537,7 +561,8 @@ async def cdbsearch(epd, depthLimit, concurrency, evalDecay, cursedWins=False):
         print("  URL       : ", url.replace(" ", "_"))
         print("", flush=True)
         depth += 1
-        if pv in [["CHECKMATE"], ["draw"], ["invalid"]]:  # nothing to be done
+        if subtreeComplete:  # nothing to be done
+            print("The subtree of the root position has been completely explored.")
             break
 
 
