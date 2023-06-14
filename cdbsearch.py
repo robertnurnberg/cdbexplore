@@ -60,6 +60,27 @@ class AtomicInteger:
             return self._value
 
 
+class AtomicDict:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = {}
+
+    def get(self, key, val=None):
+        with self._lock:
+            return self._cache.get(key, val)
+
+    def set(self, key, val):
+        with self._lock:
+            self._cache[key] = val
+
+    def __str__(self):
+        with self._lock:
+            l = []
+            for key, value in sorted(self._cache.items()):
+                l.append(f"{key}: {value}")
+            return "{" + ", ".join(l) + "}"
+
+
 class ChessDB:
     def __init__(
         self,
@@ -88,6 +109,11 @@ class ChessDB:
         self.count_inflightUncached = AtomicInteger()
         self.count_sumInflightUncached = AtomicInteger()
         self.count_reprobeQueryall = AtomicInteger()
+
+        # some counters for extra statistics
+        self.count_reprobeAsked = AtomicInteger()
+        self.count_reprobeGranted = AtomicInteger()
+        self.dict_unscoredSiblings = AtomicDict()
 
         # for timing output
         self.count_starttime = time.perf_counter()
@@ -446,6 +472,9 @@ class ChessDB:
                     if score is None:
                         allowUnscored = False
                         self.count_unscored.inc()
+                        siblings = len(scored_db_moves) - 1  # number of scored moves
+                        count = self.dict_unscoredSiblings.get(siblings, 0)
+                        self.dict_unscoredSiblings.set(siblings, count + 1)
                 elif score is not None:
                     newly_scored_moves[ucimove] = scored_db_moves[ucimove]
                     minicache[ucimove] = [ucimove]
@@ -492,6 +521,9 @@ class ChessDB:
             < self.count_uncached.get() * percentReprobePV / 100
         ):
             asyncio.ensure_future(self.reprobe_PV(board.copy(), minicache[bestmove]))
+            self.count_reprobeGranted.inc()
+        if depth >= depthReprobePV:
+            self.count_reprobeAsked.inc()
 
         # for lines leading to mates, TBwins and cursed wins we do not use mini-max, but rather store the distance in ply
         # this means local evals for such nodes will always be in sync with cdb
@@ -582,10 +614,20 @@ async def cdbsearch(
             print(
                 f"  unscored  :  {unscored} ({unscored / max(enqueued, 1) * 100:.2f}% of enqueued)"
             )
+            if unscored:
+                print(
+                    " EXTRA STATS: unscoredSiblings = ", chessdb.dict_unscoredSiblings
+                )
             uncached = max(uncached, 1)
             print(
                 f"  reprobed  :  {reprobed} ({reprobed / uncached * 100:.2f}% of chessdbq)"
             )
+            reprobeAsked = chessdb.count_reprobeAsked.get()
+            reprobeGranted = chessdb.count_reprobeGranted.get()
+            if reprobeAsked:
+                print(
+                    f" EXTRA STATS: reprobeGranted / reprobeAsked = {reprobeGranted} / {reprobeAsked} ({reprobeGranted / reprobeAsked:.2f}%)"
+                )
             print(
                 f"  inflightQ :  {chessdb.count_sumInflightUncached.get() / uncached:.2f}"
             )
