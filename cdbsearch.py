@@ -623,7 +623,7 @@ async def cdbsearch(
             reprobeGranted = chessdb.count_reprobeGranted.get()
             if reprobeAsked:
                 print(
-                    f" EXTRA STATS: reprobeGranted / reprobeAsked = {reprobeGranted} / {reprobeAsked} ({reprobeGranted / reprobeAsked:.2f})"
+                    f" EXTRA STATS: reprobeGranted / reprobeAsked = {reprobeGranted} / {reprobeAsked} ({reprobeGranted / reprobeAsked:.2f}%)"
                 )
             print(
                 f"  inflightQ :  {chessdb.count_sumInflightUncached.get() / uncached:.2f}"
