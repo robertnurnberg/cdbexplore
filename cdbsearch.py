@@ -408,8 +408,7 @@ class ChessDB:
         newly_scored_moves = {"depth": depth}
         minicache = {}  # store candidate PVs for all newly scored moves
         tasks = {}
-        scoredMoves = len(scored_db_moves) - 1
-        allowUnscored = scoredMoves >= min(CDB_SIEVED, len(list(board.legal_moves)))
+        allowUnscored = len(scored_db_moves) > CDB_SIEVED
 
         # the level of the search tree we are in, i.e. how many plies we are away from rootBoard
         level = len(board.move_stack) - len(self.rootBoard.move_stack)
