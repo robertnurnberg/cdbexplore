@@ -4,18 +4,18 @@ from io import StringIO
 from datetime import datetime, timedelta
 from multiprocessing import freeze_support
 
-# current conventions on chessdb.cn for mates, TBwins, cursed wins and special evals
-CDB_MATE = 30000
-CDB_TBWIN = 25000
-CDB_CURSED = 20000
-CDB_SPECIAL = 10000
-
-# minimum number of moves scored by cdb for analysed nodes
-CDB_SIEVED = 5
+# current conventions on chessdb.cn
+CDB_MATE = 30000  # score for mates
+CDB_TBWIN = 25000  # score for TBwins
+CDB_CURSED = 20000  # score for cursed wins
+CDB_SPECIAL = 10000  # assumed strict upper bound for material scores
+CDB_EGTB = 7  # maximum number of pieces for wdl and dtz EGTB's
+CDB_SIEVED = 5  # minimum number of scored moves for an analysed position
 
 # some (depth) constants that trigger certain events in search
 depthForceQuery = 10  # force queryall if unscored moves exist and depths exceeds this
 depthAllowExts = 4  # allow extension of the unique bestmove if depth exceeds this
+depthMaxExtension = 10  # maximum number of extensions allowed in a searched line
 depthUnscored = 25  # score an unscored move if depth - scoredCount exceeds this
 depthReprobePV = 16  # do not call reprobe_PV when depth is smaller than this
 percentReprobePV = 1  # % of queryall API calls we are willing to use for reprobe_PV
@@ -32,9 +32,11 @@ class AtomicTT:
 
     def set(self, epd, result):
         with self._lock:
-            if epd not in self._cache or self._cache[epd]["depth"] <= result["depth"]:
+            value = self._cache.get(epd)
+            if value is None or value["depth"] <= result["depth"]:
                 self._cache[epd] = result
-            return self._cache[epd]
+                return result
+            return value
 
 
 class AtomicInteger:
@@ -87,6 +89,7 @@ class ChessDB:
         concurrency,
         evalDecay,
         cursedWins=False,
+        TBsearch=False,
         rootBoard=chess.Board(),
         user=None,
     ):
@@ -94,6 +97,7 @@ class ChessDB:
         self.concurrency = concurrency
         self.evalDecay = evalDecay
         self.cursedWins = cursedWins
+        self.TBsearch = TBsearch
         self.user = "" if user is None else str(user)
 
         # the board containing as final leaf(!) the root position under which the tree will be built
@@ -103,6 +107,7 @@ class ChessDB:
         self.count_queryall = AtomicInteger()
         self.count_uncached = AtomicInteger()
         self.count_enqueued = AtomicInteger()
+        self.count_requeued = AtomicInteger()
         self.count_unscored = AtomicInteger()
         self.count_inflightRequests = AtomicInteger()
         self.count_sumInflightRequests = AtomicInteger()
@@ -167,11 +172,11 @@ class ChessDB:
     async def add_cdb_pv_positions(self, epd):
         """query cdb for the PV of the position and create a dictionary containing these positions and their distance to the PV leaf for extensions during search"""
         content = await self.__cdbapicall(f"?action=querypv&board={epd}&json=1")
-        if content and content.get("status", None) == "ok" and "pv" in content:
+        if content and content.get("status") == "ok" and "pv" in content:
             pv = content["pv"]
             self.cdbPvToLeaf[epd] = len(pv)
+            asyncio.ensure_future(self.queryall(epd))
             board = chess.Board(epd)
-            asyncio.ensure_future(self.queryall(board.epd()))
             for parsed, ucimove in enumerate(pv):
                 board.push(chess.Move.from_uci(ucimove))
                 self.cdbPvToLeaf[board.epd()] = len(pv) - 1 - parsed
@@ -312,11 +317,11 @@ class ChessDB:
                     continue
 
                 if content == {}:
-                    # the position is not available in cdb, e.g. in TB but with castling rights: score all moves as draw, and let search figure it out
+                    # the position is not available in cdb (EGTB w/ castling rights) - score all moves as 1cp, and let search figure it out
                     found = True
                     board = chess.Board(epd)
                     for move in board.legal_moves:
-                        result[move.uci()] = 0
+                        result[move.uci()] = 1  # we reserve 0 for EGTB draws
                     lasterror = "Position not queued"
                     continue
 
@@ -366,7 +371,7 @@ class ChessDB:
 
     async def reprobe_PV(self, board, pv):
         """query all positions along the PV, starting from its leaf and all the way back to the start position of rootBoard"""
-        for ucimove in pv[: -1 if pv[-1] in ["checkmate", "draw"] else None]:
+        for ucimove in pv[: -1 if pv[-1] in ["checkmate", "draw", "EGTB"] else None]:
             board.push(chess.Move.from_uci(ucimove))
         while board.move_stack:
             await self.queryall(board.epd(), skipTT=True)
@@ -391,16 +396,35 @@ class ChessDB:
         return None
 
     async def search(self, board, depth):
-        """returns (bestscore, pv) for current position stored in board"""
+        """returns (bestscore, pv, maxLevel) for current position stored in board"""
+
+        # the level of the search tree we are in, i.e. how many plies we are away from rootBoard
+        level = len(board.move_stack) - len(self.rootBoard.move_stack)
 
         t = self.check_trivial_PV(board)
         if t is not None:
-            return t
+            return *t, level
 
+        epd = board.epd()
         # get current ranking
-        scored_db_moves = await self.queryall(board.epd())
+        scored_db_moves = await self.queryall(epd)
         if scored_db_moves == {}:
-            return 0, ["invalid"]
+            return 0, ["invalid"], level
+
+        # stop search if we are in EGTB and know the result
+        if (
+            not self.TBsearch
+            and sum(p in "pnbrqk" for p in epd.lower().split()[0]) <= CDB_EGTB
+        ):
+            bestmove, bestscore = max(
+                [t for t in scored_db_moves.items() if t[0] != "depth"],
+                key=lambda t: t[1],
+            )
+            # if bestscore is 1 or -1, we have a TB position with castling rights: continue the search
+            if abs(bestscore) != 1:
+                if abs(bestscore) > CDB_SPECIAL:
+                    bestscore -= 1 if bestscore > 0 else -1
+                return bestscore, [bestmove, "EGTB"]
 
         scoredCount = len(scored_db_moves) - 1  # number of scored moves for board
         movesCount = len(list(board.legal_moves))  # numer of legal moves
@@ -409,17 +433,14 @@ class ChessDB:
         # for positions with an incomplete move list, we schedule a queue API call, since querall for positions beyond cdb's old piece count limit may not be enough to add new moves
         if missingCDBmoves:
             asyncio.ensure_future(
-                self.__cdbapicall(
-                    f"?action=queue&board={board.epd()}&json=1", timeout=60
-                )
+                self.__cdbapicall(f"?action=queue&board={epd}&json=1", timeout=60)
             )
+            self.count_requeued.inc()
 
         # force a query for high depth nodes that do not have a full list of scored moves: we use this to add newly scored moves to our TT
         skipTT_db_moves = None
         if (depth > depthForceQuery and scoredCount < movesCount) or missingCDBmoves:
-            skipTT_db_moves = asyncio.create_task(
-                self.queryall(board.epd(), skipTT=True)
-            )
+            skipTT_db_moves = asyncio.create_task(self.queryall(epd, skipTT=True))
 
         bestscore = -(CDB_MATE + 1)
         bestmove = None
@@ -433,7 +454,7 @@ class ChessDB:
 
         moves_to_search = 0
         for move in board.legal_moves:
-            score = scored_db_moves.get(move.uci(), None)
+            score = scored_db_moves.get(move.uci())
             newdepth = self.move_depth(bestscore, worstscore, score, depth)
             if newdepth >= 0:
                 moves_to_search += 1
@@ -443,9 +464,6 @@ class ChessDB:
         tasks = {}
         allowUnscored = scoredCount >= CDB_SIEVED  # allow search of unscored moves
 
-        # the level of the search tree we are in, i.e. how many plies we are away from rootBoard
-        level = len(board.move_stack) - len(self.rootBoard.move_stack)
-
         # guarantee sufficient length of the semaphoreTree list, and limit the number of threads that can be created at each level of the search tree
         while len(self.semaphoreTree) < level + 1:
             self.semaphoreTree.append(asyncio.Semaphore(4 * self.concurrency))
@@ -453,16 +471,20 @@ class ChessDB:
         async with self.semaphoreTree[level]:
             for move in board.legal_moves:
                 ucimove = move.uci()
-                score = scored_db_moves.get(ucimove, None)
+                score = scored_db_moves.get(ucimove)
                 newdepth = self.move_depth(bestscore, worstscore, score, depth)
 
                 # extension if the unique bestmove is the only move to be searched deeper or the position is in the cdb PV
                 if score == bestscore:
-                    cdbPvToLeaf = self.cdbPvToLeaf.get(board.epd(), None)
+                    cdbPvToLeaf = self.cdbPvToLeaf.get(epd)
                     if (moves_to_search == 1 and depth > depthAllowExts) or (
                         cdbPvToLeaf is not None and newdepth < cdbPvToLeaf
                     ):
                         newdepth += 1
+
+                # no extensions beyond depthMaxExtension
+                if level >= self.rootDepth + depthMaxExtension:
+                    newdepth = -1
 
                 # schedule qualifying moves for deeper searches, at most 1 unscored move
                 # for sufficiently large depth and suffiently small scoredCount we possibly schedule an unscored move
@@ -485,30 +507,34 @@ class ChessDB:
                     newly_scored_moves[ucimove] = scored_db_moves[ucimove]
                     minicache[ucimove] = [ucimove]
 
+            maxLevel = level
             # get the results from the futures
             for ucimove, search in tasks.items():
-                s, pv = await search
+                s, pv, l = await search
                 newly_scored_moves[ucimove] = -s
                 minicache[ucimove] = [ucimove] + pv
+                maxLevel = max(maxLevel, l)
 
         # add potentially newly scored moves, or moves we have not explored by search
         if skipTT_db_moves:
             skipTT_db_moves = await skipTT_db_moves
             for move in board.legal_moves:
                 ucimove = move.uci()
-                if ucimove in skipTT_db_moves:
-                    if ucimove not in newly_scored_moves:
-                        newly_scored_moves[ucimove] = skipTT_db_moves[ucimove]
+                skipTT_score = skipTT_db_moves.get(ucimove)
+                if skipTT_score is not None:
+                    newly_score = newly_scored_moves.get(ucimove)
+                    if newly_score is None:
+                        newly_scored_moves[ucimove] = skipTT_score
                         minicache[ucimove] = [ucimove]
-                    elif newly_scored_moves[ucimove] != skipTT_db_moves[ucimove]:
+                    elif newly_score != skipTT_score:
                         board.push(move)
                         if self.TT.get(board.epd()) is None:
-                            newly_scored_moves[ucimove] = skipTT_db_moves[ucimove]
+                            newly_scored_moves[ucimove] = skipTT_score
                             minicache[ucimove] = [ucimove]
                         board.pop()
 
         # store our computed result
-        self.TT.set(board.epd(), newly_scored_moves)
+        self.TT.set(epd, newly_scored_moves)
 
         # find bestmove and associated PV
         bestscore = -(CDB_MATE + 1)
@@ -534,9 +560,9 @@ class ChessDB:
         # for lines leading to mates, TBwins and cursed wins we do not use mini-max, but rather store the distance in ply
         # this means local evals for such nodes will always be in sync with cdb
         if abs(bestscore) > CDB_SPECIAL:
-            bestscore -= 1 if bestscore >= 0 else -1
+            bestscore -= 1 if bestscore > 0 else -1
 
-        return bestscore, minicache[bestmove]
+        return bestscore, minicache[bestmove], maxLevel
 
 
 async def cdbsearch(
@@ -545,6 +571,7 @@ async def cdbsearch(
     concurrency,
     evalDecay,
     cursedWins=False,
+    TBsearch=False,
     proveMates=False,
     user=None,
 ):
@@ -559,6 +586,8 @@ async def cdbsearch(
         print("User name    : ", user)
     if cursedWins:
         print("Cursed Wins  :  True")
+    if TBsearch:
+        print("TB search    :  True")
     if proveMates:
         print("Prove Mates  :  True")
     print("Starting date: ", datetime.now().isoformat())
@@ -579,6 +608,7 @@ async def cdbsearch(
         concurrency=concurrency,
         evalDecay=evalDecay,
         cursedWins=cursedWins,
+        TBsearch=TBsearch,
         rootBoard=board.copy(),
         user=user,
     )
@@ -588,22 +618,24 @@ async def cdbsearch(
         print("Search at depth ", depth)
         await chessdb.add_cdb_pv_positions(board.epd())
         print("  cdb PV len: ", chessdb.cdbPvToLeaf.get(board.epd(), 0), flush=True)
-        bestscore, pv = await chessdb.search(board, depth)
+        chessdb.rootDepth = depth
+        bestscore, pv, level = await chessdb.search(board, depth)
         # always reprobe the root PV
         asyncio.ensure_future(chessdb.reprobe_PV(board.copy(), pv))
         print("  score     : ", bestscore)
-        pvlen = len(pv) - (pv[-1] in ["checkmate", "draw", "invalid"])
+        pvlen = len(pv) - (pv[-1] in ["checkmate", "draw", "EGTB", "invalid"])
         if proveMates and pv[-1] == "checkmate" and pvlen:
             print("  PV        : ", " ".join(pv[:-1]), end=" ", flush=True)
             if await chessdb.pv_has_proven_mate(board.copy(), pv):
-                mStr = f"(#{(pvlen+1)//2})" if bestscore > 0 else f" (#-{pvlen//2})"
+                mStr = f"(#{(pvlen+1)//2})" if bestscore > 0 else f"(#-{pvlen//2})"
                 print("CHECKMATE", mStr)
             else:
                 print("checkmate")
         else:
             print("  PV        : ", " ".join(pv))
         print("  PV len    : ", pvlen)
-        print("  max ply   : ", len(chessdb.semaphoreTree))
+        print("  level     : ", level)
+        print("  max level : ", len(chessdb.semaphoreTree))
         queryall = chessdb.count_queryall.get()
         if queryall:
             uncached = chessdb.count_uncached.get()
@@ -612,11 +644,12 @@ async def cdbsearch(
             unscored = chessdb.count_unscored.get()
             runtime = time.perf_counter() - chessdb.count_starttime
             print("  queryall  : ", queryall)
-            print(f"  bf        :  {queryall**(1/depth):.2f}")
+            print(f"  bf        :  {queryall**(1/(level+1)):.2f}")
             print(
                 f"  chessdbq  :  {uncached} ({uncached / queryall * 100:.2f}% of queryall)"
             )
             print("  enqueued  : ", enqueued)
+            print("  requeued  : ", chessdb.count_requeued.get())
             print(
                 f"  unscored  :  {unscored} ({unscored / max(enqueued, 1) * 100:.2f}% of enqueued)"
             )
@@ -651,8 +684,8 @@ async def cdbsearch(
         url = f"https://chessdb.cn/queryc_en/?{epd}{pvline}"
         print(f"  URL       :  {url.replace(' ', '_')}\n")
         depth += 1
-        if pv in [["checkmate"], ["draw"], ["invalid"]]:  # nothing to be done
-            break
+        if pvlen == 0 or pvlen == 1 and pv[-1] == "EGTB":
+            break  # nothing to be done
 
 
 if __name__ == "__main__":
@@ -695,6 +728,11 @@ if __name__ == "__main__":
         help="Treat cursed wins as wins.",
     )
     argParser.add_argument(
+        "--TBsearch",
+        action="store_true",
+        help="Extend the searching and exploration of lines into cdb's EGTB.",
+    )
+    argParser.add_argument(
         "--proveMates",
         action="store_true",
         help='Attempt to prove that mate PV lines have no better defence. Proven mates are indicated with "CHECKMATE" at the end of the PV, whereas unproven ones use "checkmate".',
@@ -723,6 +761,7 @@ if __name__ == "__main__":
             concurrency=args.concurrency,
             evalDecay=args.evalDecay,
             cursedWins=args.cursedWins,
+            TBsearch=args.TBsearch,
             proveMates=args.proveMates,
             user=args.user,
         )
